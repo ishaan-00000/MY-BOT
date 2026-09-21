@@ -8,17 +8,16 @@ const https = require('https');
 const setupLeaveRejoin = require('./leaveRejoin');
 
 // ============================================================
-// EXPRESS SERVER - Keep Render/Aternos alive
+// EXPRESS SERVER - Web Dashboard & Health Check
 // ============================================================
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 
 let bot = null;
 let activeIntervals = [];
 let reconnectTimeout = null;
 let isReconnecting = false;
 
-// Bot state tracking
 let botState = {
   connected: false,
   lastActivity: Date.now(),
@@ -27,7 +26,6 @@ let botState = {
   errors: []
 };
 
-// Health check endpoint for monitoring
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -112,7 +110,7 @@ app.get('/', (req, res) => {
 
           <div class="stat-card">
             <div class="label">Server</div>
-            <div class="value">${config.server.ip}</div>
+            <div class="value">${config.server.ip}:${config.server.port}</div>
           </div>
 
           <a href="/tutorial" class="btn-guide">View Setup Guide</a>
@@ -141,7 +139,7 @@ app.get('/', (req, res) => {
                 statusText.style.color = '#2dd4bf';
                 liveDot.style.color = '#4ade80';
               } else {
-                statusText.innerHTML = '<span class="status-dot" style="color: #f87171;"></span> Cycling / Offline';
+                statusText.innerHTML = '<span class="status-dot" style="color: #f87171;"></span> Cycling / Reconnecting...';
                 statusText.style.color = '#f87171';
                 liveDot.style.color = '#f87171';
               }
@@ -172,25 +170,22 @@ app.get('/tutorial', (req, res) => {
   res.send(`
     <html>
       <head>
-        <title>${config.name} - Setup Guide</title>
+        <title>${config.name || 'Bot'} - Setup Guide</title>
         <style>
           body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #cbd5e1; padding: 40px; max-width: 800px; margin: 0 auto; line-height: 1.6; }
-          h1, h2 { color: #2dd4bf; }
-          h1 { border-bottom: 2px solid #334155; padding-bottom: 10px; }
+          h1 { color: #2dd4bf; border-bottom: 2px solid #334155; padding-bottom: 10px; }
           .card { background: #1e293b; padding: 25px; border-radius: 12px; margin-bottom: 20px; border: 1px solid #334155; }
-          a { color: #38bdf8; text-decoration: none; }
-          code { background: #334155; padding: 2px 6px; border-radius: 4px; color: #e2e8f0; font-family: monospace; }
           .btn-home { display: inline-block; margin-bottom: 20px; padding: 8px 16px; background: #334155; color: white; border-radius: 6px; text-decoration: none; }
         </style>
       </head>
       <body>
         <a href="/" class="btn-home">Back to Dashboard</a>
-        <h1>Setup Guide</h1>
+        <h1>Aternos Settings Checklist</h1>
         <div class="card">
-          <h2>Server Configuration</h2>
           <ol>
-            <li>Enable <strong>Cracked</strong> mode on your server (if using offline bot account).</li>
-            <li>Install plugins: <code>ViaVersion</code>, <code>ViaBackwards</code> if using mixed client versions.</li>
+            <li>Enable <strong>Cracked</strong> mode under Server Options.</li>
+            <li>Use the <strong>Dyn IP (Dynamic IP)</strong> in settings.json instead of the general domain.</li>
+            <li>Ensure the server is <strong>Online</strong> when starting the bot container.</li>
           </ol>
         </div>
       </body>
@@ -215,15 +210,15 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`[Server] HTTP server started on port ${PORT}`);
 });
 
-// Self-ping to keep free cloud tiers awake
+// Self-ping keeping Railway / Web Service awake
 const SELF_PING_INTERVAL = 10 * 60 * 1000;
 function startSelfPing() {
   setInterval(() => {
-    const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+    const url = process.env.RAILWAY_STATIC_URL ? `https://${process.env.RAILWAY_STATIC_URL}` : `http://localhost:${PORT}`;
     const client = url.startsWith('https') ? https : http;
 
     client.get(`${url}/ping`, (res) => {}).on('error', (err) => {
-      console.log(`[KeepAlive] Ping issue: ${err.message}`);
+      console.log(`[KeepAlive] Ping failed: ${err.message}`);
     });
   }, SELF_PING_INTERVAL);
   console.log('[KeepAlive] Self-ping system active.');
@@ -231,34 +226,45 @@ function startSelfPing() {
 startSelfPing();
 
 // ============================================================
-// BOT LIFECYCLE MANAGEMENT
+// BOT LIFECYCLE & RECONNECT MANAGEMENT
 // ============================================================
 function clearAllIntervals() {
   activeIntervals.forEach(id => clearInterval(id));
   activeIntervals = [];
 }
 
-function addInterval(callback, delay) {
-  const id = setInterval(callback, delay);
-  activeIntervals.push(id);
-  return id;
+function scheduleReconnect(reason = 'end') {
+  if (isReconnecting) return;
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
+
+  isReconnecting = true;
+  botState.reconnectAttempts++;
+
+  const baseDelay = (config.utils && config.utils['auto-reconnect-delay']) || 3000;
+  const maxDelay = (config.utils && config.utils['max-reconnect-delay']) || 15000;
+  const delay = Math.min(baseDelay + (botState.reconnectAttempts * 1000), maxDelay);
+
+  console.log(`[Bot] Reconnecting in ${delay / 1000}s (reason: ${reason}, attempt: #${botState.reconnectAttempts})`);
+
+  reconnectTimeout = setTimeout(() => {
+    isReconnecting = false;
+    createBot();
+  }, delay);
 }
 
 function createBot() {
   if (isReconnecting) {
-    console.log('[Bot] Connection creation already in progress, skipping...');
+    console.log('[Bot] Reconnect already queued, skipping...');
     return;
   }
 
-  // Teardown previous bot completely to stop memory leaks
+  // Teardown previous bot completely to prevent memory leaks
   if (bot) {
     clearAllIntervals();
     try {
       bot.removeAllListeners();
       bot.end();
-    } catch (e) {
-      // Ignore cleanup error
-    }
+    } catch (e) {}
     bot = null;
   }
 
@@ -273,24 +279,27 @@ function createBot() {
       port: config.server.port,
       version: config.server.version,
       hideErrors: false,
-      checkTimeoutInterval: 120000
+      checkTimeoutInterval: 60000
     });
 
     bot.loadPlugin(pathfinder);
 
-    // Give leaveRejoin full management over AFK cycling and reconnect queues
+    // Give leaveRejoin module control over the intentional AFK cycle
     setupLeaveRejoin(bot, () => {
       isReconnecting = false;
       createBot();
     });
 
-    // Fallback connection timeout if bot hangs before spawn
+    // 25-second spawn timeout (cancels hanging connection attempts)
     const connectionTimeout = setTimeout(() => {
       if (!botState.connected) {
-        console.log('[Bot] Timeout - No spawn event received in 60s');
-        try { bot.end(); } catch (e) {}
+        console.log('[Bot] Connection timed out before spawn event.');
+        if (bot) {
+          try { bot.end(); } catch (e) {}
+        }
+        scheduleReconnect('spawn-timeout');
       }
-    }, 60000);
+    }, 25000);
 
     bot.once('spawn', () => {
       clearTimeout(connectionTimeout);
@@ -301,12 +310,10 @@ function createBot() {
 
       console.log(`[Bot] [+] Successfully spawned on server!`);
 
-      // Initialize plugins & movement
       const mcData = require('minecraft-data')(bot.version || config.server.version);
       const defaultMove = new Movements(bot, mcData);
       initializeModules(bot, mcData, defaultMove);
 
-      // Safe post-spawn commands
       setTimeout(() => {
         if (bot && botState.connected) {
           bot.chat('/gamerule sendCommandFeedback false');
@@ -316,9 +323,15 @@ function createBot() {
     });
 
     bot.on('end', (reason) => {
+      clearTimeout(connectionTimeout);
       console.log(`[Bot] Disconnected: ${reason || 'Unknown reason'}`);
       botState.connected = false;
       clearAllIntervals();
+
+      // If leaveRejoin is intentionally handling this cycle, do not reconnect here
+      if (!bot || !bot.intentionalAFKQuit) {
+        scheduleReconnect(reason || 'end');
+      }
     });
 
     bot.on('kicked', (reason) => {
@@ -331,12 +344,8 @@ function createBot() {
     });
 
   } catch (err) {
-    console.log(`[Bot] Failed to initiate instance: ${err.message}`);
-    // Retry after 5s if instantiating crashes
-    setTimeout(() => {
-      isReconnecting = false;
-      createBot();
-    }, 5000);
+    console.log(`[Bot] Failed to create bot instance: ${err.message}`);
+    scheduleReconnect('create-error');
   }
 }
 
@@ -346,7 +355,7 @@ function createBot() {
 function initializeModules(bot, mcData, defaultMove) {
   let authDone = false;
 
-  // Single unified chat-auth handler
+  // Handles /login & /register prompts safely without spamming
   bot.on('messagestr', (msg) => {
     const message = msg.toLowerCase();
 
@@ -367,23 +376,15 @@ function initializeModules(bot, mcData, defaultMove) {
     }
   });
 
-  // Pathfinder destination
+  // Pathfinder goal configuration
   if (config.position && config.position.enabled) {
     bot.pathfinder.setMovements(defaultMove);
     bot.pathfinder.setGoal(new GoalBlock(config.position.x, config.position.y, config.position.z));
   }
 
-  // Optional sneaking
+  // Auto-sneak
   if (config.utils && config.utils['anti-afk'] && config.utils['anti-afk'].sneak) {
     bot.setControlState('sneak', true);
-  }
-
-  // Optional plugin modules if present in project
-  if (config.modules) {
-    if (config.modules.avoidMobs && typeof avoidMobs === 'function') avoidMobs(bot);
-    if (config.modules.combat && typeof combatModule === 'function') combatModule(bot, mcData);
-    if (config.modules.beds && typeof bedModule === 'function') bedModule(bot, mcData);
-    if (config.modules.chat && typeof chatModule === 'function') chatModule(bot);
   }
 }
 
