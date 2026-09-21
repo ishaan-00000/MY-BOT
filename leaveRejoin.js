@@ -24,11 +24,19 @@ function setupLeaveRejoin(bot, createBot) {
 
     function cleanup() {
         stopped = true
+        
+        // 1. Clear all active timers
         if (leaveTimer) clearTimeout(leaveTimer)
         if (jumpTimer) clearTimeout(jumpTimer)
         if (jumpOffTimer) clearTimeout(jumpOffTimer)
         if (reconnectTimer) clearTimeout(reconnectTimer)
+        
         leaveTimer = jumpTimer = jumpOffTimer = reconnectTimer = null
+
+        // 2. Remove event listeners to prevent memory leaks across 24/7 restarts
+        bot.removeListener('end', onEnd)
+        bot.removeListener('kicked', onKicked)
+        bot.removeListener('error', onError)
     }
 
     function scheduleNextJump() {
@@ -44,19 +52,18 @@ function setupLeaveRejoin(bot, createBot) {
         jumpTimer = setTimeout(scheduleNextJump, nextJump)
     }
 
+    // Handles the delay before recreating the bot
     function scheduleReconnect(reason = 'end') {
         if (stopped) return
 
-        // FAST RECONNECT: 2s -> 10s (User requested faster)
         let delay = randomMs(2000, 10000)
 
-        // Slight backoff for repeated failures, but keep it snappy
         reconnectAttempts++
         if (reconnectAttempts > 3) {
-            delay += 5000 // Add 5s if it's failing a lot
+            delay += 5000 // Backoff if failing frequently
         }
 
-        // Cap at 30s max
+        // Cap at 15s max
         delay = Math.min(delay, 15000)
 
         logThrottled(`[AFK] Rejoin scheduled in ${Math.round(delay / 1000)}s (reason: ${reason}, attempt: ${reconnectAttempts})`)
@@ -73,15 +80,17 @@ function setupLeaveRejoin(bot, createBot) {
     }
 
     bot.once('spawn', () => {
-        // reset attempt counter on successful connect
         reconnectAttempts = 0
-
-        // clear any old timers
-        cleanup()
+        cleanup() // Clear anything old
+        
+        // Re-attach listeners for the active bot
+        bot.on('end', onEnd)
+        bot.on('kicked', onKicked)
+        bot.on('error', onError)
+        
         stopped = false
 
-        // Stay connected: 2 minutes -> 15 minutes (More realistic AFK behavior)
-        // Stay connected 1-5 minutes before a scheduled leave/rejoin cycle.
+        // Stay connected 1-5 minutes
         const stayTime = randomMs(60000, 300000)
 
         logThrottled(`[AFK] Will leave in ${Math.round(stayTime / 1000)} seconds`)
@@ -90,29 +99,48 @@ function setupLeaveRejoin(bot, createBot) {
 
         leaveTimer = setTimeout(() => {
             if (stopped) return
-            logThrottled('[AFK] Leaving server (timer)')
+            logThrottled('[AFK] Leaving server intentionally for AFK cycle...')
+            
+            // Flag to tell index.js NOT to auto-reconnect, because THIS file is handling it
+            bot.intentionalAFKQuit = true 
+            
             cleanup()
+            
             try {
                 bot.quit()
             } catch (e) {
-                // ignore if already closed
+                // Ignore socket errors if already disconnected
             }
+
+            // We handle the intentional AFK reconnect timer here
+            scheduleReconnect('afk-cycle')
         }, stayTime)
     })
 
-    // When the connection ends for ANY reason, just clean up our timers.
-    // Reconnection is handled by index.js — no duplicate reconnect here.
-    bot.on('end', () => {
-        cleanup()
-    })
+    // --- Named Event Handlers --- 
+    // Using named functions allows us to cleanly remove them in cleanup()
 
-    bot.on('kicked', () => {
-        cleanup()
-    })
+    function onEnd() {
+        if (bot.intentionalAFKQuit) return // Handled by leaveTimer
 
-    bot.on('error', () => {
         cleanup()
-    })
+        // If the server crashes or kicks the bot unexpectedly, we let this module 
+        // manage the reconnect delay so it shares the same backoff logic.
+        scheduleReconnect('unexpected-drop') 
+    }
+
+    function onKicked(reason) {
+        if (bot.intentionalAFKQuit) return
+        console.log(`[AFK] Bot kicked: ${reason}`)
+        cleanup()
+        scheduleReconnect('kicked')
+    }
+
+    function onError(err) {
+        console.log(`[AFK] Bot error: ${err?.message || err}`)
+        cleanup()
+        scheduleReconnect('error')
+    }
 }
 
 module.exports = setupLeaveRejoin
