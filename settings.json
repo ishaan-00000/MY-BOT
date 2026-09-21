@@ -6,9 +6,9 @@
     "type": "offline"
   },
   "server": {
-    "ip": "BoxyArtistparkoursmp.aternos.me",
+    "ip": "balashark.aternos.host",
     "port": 21865,
-    "version": "1.21.1"
+    "version": "1.21.11"
   },
   "position": {
     "enabled": true,
